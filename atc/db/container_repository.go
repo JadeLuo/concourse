@@ -289,9 +289,35 @@ func selectContainers(asOptional ...string) sq.SelectBuilder {
 		table += " " + as
 		teamId = as + "." + teamId
 	}
+
 	columns = append(columns, "COALESCE(t.name, '') as team_name")
 
-	return psql.Select(columns...).From(table).LeftJoin("teams as t on t.id =" + teamId)
+	// TODO: continue from here
+	//return psql.Select(columns...).From(table).LeftJoin("teams as t ON t.id =" + teamId)
+	return psql.Select(columns...).From(table).LeftJoin("teams as t ON t.id =" + teamId)
+}
+
+
+func selectContainersWithAdditionalColumns(asOptional ...string) sq.SelectBuilder {
+	columns := []string{"id", "handle", "worker_name", "hijacked", "discontinued", "state"}
+
+	columns = append(columns, containerMetadataColumns...)
+	table := "containers"
+	teamId := "team_id"
+	if len(asOptional) > 0 {
+		as := asOptional[0]
+		for i, c := range columns {
+			columns[i] = as + "." + c
+		}
+
+		table += " " + as
+		teamId = as + "." + teamId
+	}
+	if len(asOptional) > 1 {
+		columns = append(columns, asOptional[1:]...)
+	}
+
+	return psql.Select(columns...).From(table)
 }
 
 func scanContainer(row sq.RowScanner, conn Conn) (CreatingContainer, CreatedContainer, DestroyingContainer, FailedContainer, error) {
@@ -379,11 +405,12 @@ func (repository *containerRepository) DestroyFailedContainers() (int, error) {
 }
 
 func (repository *containerRepository) AllContainers() ([]Container, error) {
-	rows, err := selectContainers("c").
+	rows, err := selectContainersWithAdditionalColumns("c", "t.name").
 		Join("workers w ON c.worker_name = w.name").
 		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
 		Join("resources r ON r.resource_config_id = rccs.resource_config_id").
 		Join("pipelines p ON p.id = r.pipeline_id").
+		Join("teams t ON t.id=p.team_id").
 		Distinct().
 		RunWith(repository.conn).
 		Query()
@@ -397,11 +424,12 @@ func (repository *containerRepository) AllContainers() ([]Container, error) {
 		return nil, err
 	}
 
-	rows, err = selectContainers("c").
+	rows, err = selectContainersWithAdditionalColumns("c", "t.name").
 		Join("workers w ON c.worker_name = w.name").
 		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
 		Join("resource_types rt ON rt.resource_config_id = rccs.resource_config_id").
 		Join("pipelines p ON p.id = rt.pipeline_id").
+		Join("teams t ON t.id = p.team_id").
 		Distinct().
 		RunWith(repository.conn).
 		Query()
@@ -414,7 +442,8 @@ func (repository *containerRepository) AllContainers() ([]Container, error) {
 		return nil, err
 	}
 
-	rows, err = selectContainers("c").
+	rows, err = selectContainersWithAdditionalColumns("c", "t.name").
+		Join("teams t ON t.id = c.team_id").
 		Where(sq.NotEq{
 			"c.team_id": nil,
 		}).
@@ -433,43 +462,68 @@ func (repository *containerRepository) AllContainers() ([]Container, error) {
 }
 
 func (repository *containerRepository) VisibleContainers(teamNames []string) ([]Container, error) {
-	teamsIn := sq.Or{}
-	for _, teamName := range teamNames {
-		teamsIn = append(teamsIn, sq.Eq{"t.name": teamName})
+	//query all the team ids
+	teamIds := []int {}
+	teamRows, teamErr := psql.Select("id").From("teams").Where(sq.Eq{"name": teamNames}).RunWith(repository.conn).Query()
+	if teamErr != nil {
+		return nil, teamErr
 	}
+	err := teamRows.Scan(teamIds)
 
-	rows, err := selectContainers("c").
-		Where(teamsIn).
+	rows, err := selectContainersWithAdditionalColumns("c", "t.name").
+		Join("workers w ON c.worker_name = w.name").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Join("resources r ON r.resource_config_id = rccs.resource_config_id").
+		Join("pipelines p ON p.id = r.pipeline_id").
+		Join("teams t ON t.id = p.team_id").
+		Where(sq.Eq{"t.name": teamNames}).
+		Where(sq.Or{sq.Eq{"w.team_id": teamIds}, sq.NotEq{"w.team_id": nil}}).
+		Distinct().
 		RunWith(repository.conn).
 		Query()
-
 	if err != nil {
 		return nil, err
 	}
 
 	var containers []Container
-	currentTeamContainers, err := scanContainers(rows, repository.conn, containers)
+	containers, err = scanContainers(rows, repository.conn, containers)
 	if err != nil {
 		return nil, err
 	}
 
-	//TODO: figure out whether we do have otherTeamPublicContainers
+	rows, err = selectContainersWithAdditionalColumns("c", "t.name").
+		Join("workers w ON c.worker_name = w.name").
+		Join("resource_config_check_sessions rccs ON rccs.id = c.resource_config_check_session_id").
+		Join("resource_types rt ON rt.resource_config_id = rccs.resource_config_id").
+		Join("pipelines p ON p.id = rt.pipeline_id").
+		Join("teams t ON t.id = p.team_id").
+		Where(sq.Eq{"t.name": teamNames}).
+		Where(sq.Or{sq.Eq{"w.team_id": teamIds}, sq.NotEq{"w.team_id": nil}}).
+		Distinct().
+		RunWith(repository.conn).
+		Query()
+	if err != nil {
+		return nil, err
+	}
 
-	//rows, err = pipelinesQuery.
-	//	Where(sq.NotEq{"t.name": teamNames}).
-	//	Where(sq.Eq{"public": true}).
-	//	OrderBy("team_id ASC", "ordering ASC").
-	//	RunWith(repository.conn).
-	//	Query()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//
-	//otherTeamPublicContainers, err := scanContainers(rows, repository.conn, containers)
-	//if err != nil {
-	//	return nil, err
-	//}
-	//return append(currentTeamContainers, otherTeamPublicContainers...), nil
+	containers, err = scanContainers(rows, repository.conn, containers)
+	if err != nil {
+		return nil, err
+	}
 
-	return currentTeamContainers, nil
+	rows, err = selectContainersWithAdditionalColumns("c", "t.name").
+		Join("teams t ON t.id = c.team_id").
+		Where(sq.Eq{"t.name": teamNames}).
+		RunWith(repository.conn).
+		Query()
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err = scanContainers(rows, repository.conn, containers)
+	if err != nil {
+		return nil, err
+	}
+
+	return containers, nil
 }
